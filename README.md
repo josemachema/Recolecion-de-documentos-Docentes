@@ -127,5 +127,5 @@ Este proyecto es de uso interno. Puede ser adaptado para otros ciclos escolares 
 ---
 
 ## ✨ Autor
-Coordinación Académica – Sistema de Monitoreo de Entregas  
+José María Gerónimo Pérez – Sistema de Monitoreo de Entregas  
 Diseñado para facilitar el seguimiento de planeaciones y evidencias en instituciones educativas.
