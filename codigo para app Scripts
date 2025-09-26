@@ -1,0 +1,237 @@
+/***** CONFIG BÁSICA *****/
+const SHEET_DOCENTES = 'Docentes';
+const SHEET_ENTREGAS = 'Entregas';
+const SHEET_CONFIG   = 'Config';
+
+function onOpen() {
+  SpreadsheetApp.getUi()
+    .createMenu('Monitoreo')
+    .addItem('1) Crear/Actualizar carpetas por maestro', 'setupFoldersFromSheet')
+    .addItem('2) Crear subcarpetas mensuales', 'ensureMonthlySubfoldersForAll')
+    .addItem('3) Sincronizar entregas ahora', 'syncAllDeliveries')
+    .addItem('4) Instalar disparador diario (18:00)', 'installDailyTrigger')
+    .addToUi();
+}
+
+/***** UTILIDADES *****/
+function getConfig_(key) {
+  const sh = SpreadsheetApp.getActive().getSheetByName(SHEET_CONFIG);
+  const values = sh.getDataRange().getValues();
+  const map = Object.fromEntries(values.slice(1).map(r => [String(r[0]||'').trim(), String(r[1]||'').trim()]));
+  return map[key] || '';
+}
+
+function getRootFolder_() {
+  const id = getConfig_('ROOT_FOLDER_ID');
+  if (!id) throw new Error('Falta ROOT_FOLDER_ID en hoja Config.');
+  return DriveApp.getFolderById(id);
+}
+
+function isoWeek_(date) {
+  const d = new Date(Date.UTC(date.getFullYear(), date.getMonth(), date.getDate()));
+  const dayNum = d.getUTCDay() || 7;
+  d.setUTCDate(d.getUTCDate() + 4 - dayNum);
+  const yearStart = new Date(Date.UTC(d.getUTCFullYear(),0,1));
+  return Math.ceil((((d - yearStart) / 86400000) + 1)/7);
+}
+
+function formatYYYYMM_(date) {
+  const y = date.getFullYear();
+  const m = (date.getMonth()+1).toString().padStart(2,'0');
+  return `${y}-${m}`;
+}
+
+function cleanString_(s){ return String(s||'').trim(); }
+
+function writeBackToSheet_(sheetName, row, colName, value) {
+  const sh = SpreadsheetApp.getActive().getSheetByName(sheetName);
+  const headers = sh.getRange(1,1,1,sh.getLastColumn()).getValues()[0];
+  const colIndex = headers.indexOf(colName)+1;
+  if (colIndex < 1) throw new Error(`Columna "${colName}" no existe en ${sheetName}`);
+  sh.getRange(row, colIndex).setValue(value);
+}
+
+/***** 1) CREAR/ACTUALIZAR CARPETAS PERSONALES *****/
+function setupFoldersFromSheet() {
+  const root = getRootFolder_();
+  const sh = SpreadsheetApp.getActive().getSheetByName(SHEET_DOCENTES);
+  const data = sh.getDataRange().getValues();
+  const headers = data[0];
+  const idx = {
+    maestro: headers.indexOf('Maestro'),
+    email: headers.indexOf('Email'),
+    carpetaId: headers.indexOf('CarpetaID'),
+    activo: headers.indexOf('Activo')
+  };
+  if (Object.values(idx).some(i => i < 0)) throw new Error('Verifica columnas en "Docentes": Maestro, Email, CarpetaID, Activo.');
+
+  for (let r=1; r<data.length; r++) {
+    const maestro = cleanString_(data[r][idx.maestro]);
+    const email   = cleanString_(data[r][idx.email]);
+    const activo  = String(data[r][idx.activo]).toLowerCase() !== 'false';
+    if (!maestro || !email || !activo) continue;
+
+    let carpetaId = cleanString_(data[r][idx.carpetaId]);
+    let folder;
+    if (carpetaId) {
+      folder = DriveApp.getFolderById(carpetaId);
+    } else {
+      // Crear carpeta personal: "Maestro - Nombre"
+      const name = `Maestro - ${maestro}`;
+      // Evitar duplicados por nombre
+      const it = getRootFolder_().getFoldersByName(name);
+      folder = it.hasNext() ? it.next() : root.createFolder(name);
+      try {
+        folder.addEditor(email); // comparte SOLO con ese maestro (además de ti)
+      } catch (e) {
+        Logger.log(`No se pudo compartir con ${email}: ${e}`);
+      }
+      writeBackToSheet_(SHEET_DOCENTES, r+1, 'CarpetaID', folder.getId());
+    }
+  }
+  SpreadsheetApp.getUi().alert('Listo: carpetas personales creadas/actualizadas.');
+}
+
+/***** 2) CREAR SUBCARPETAS MENSUALES DENTRO DE CADA CARPETA PERSONAL *****/
+function ensureMonthlySubfoldersForAll() {
+  const year = Number(getConfig_('AÑO_ACTUAL')) || (new Date()).getFullYear();
+  const sh = SpreadsheetApp.getActive().getSheetByName(SHEET_DOCENTES);
+  const data = sh.getDataRange().getValues();
+  const headers = data[0];
+  const idx = {
+    maestro: headers.indexOf('Maestro'),
+    carpetaId: headers.indexOf('CarpetaID'),
+    activo: headers.indexOf('Activo')
+  };
+  for (let r=1; r<data.length; r++) {
+    const activo  = String(data[r][idx.activo]).toLowerCase() !== 'false';
+    if (!activo) continue;
+    const carpetaId = cleanString_(data[r][idx.carpetaId]);
+    if (!carpetaId) continue;
+    const folder = DriveApp.getFolderById(carpetaId);
+    // crear 12 meses
+    for (let m=1; m<=12; m++) {
+      const name = `${year}-${m.toString().padStart(2,'0')}`;
+      const it = folder.getFoldersByName(name);
+      if (!it.hasNext()) folder.createFolder(name);
+    }
+  }
+  SpreadsheetApp.getUi().alert('Subcarpetas mensuales verificadas/creadas.');
+}
+
+/***** 3) SINCRONIZAR ENTREGAS (escanea Drive y registra en hoja) *****/
+function syncAllDeliveries() {
+  const year = Number(getConfig_('AÑO_ACTUAL')) || (new Date()).getFullYear();
+  const deadlineDay = Number(getConfig_('DIA_LIMITE')) || 7; // regla simple: antes/dentro del día 7 = a tiempo
+  const tiposDoc = getConfig_('TIPOS_DOC').toLowerCase().split(',').map(s=>cleanString_(s));
+
+  const ss = SpreadsheetApp.getActive();
+  const shDoc = ss.getSheetByName(SHEET_DOCENTES);
+  const shLog = ss.getSheetByName(SHEET_ENTREGAS);
+  
+  const headers = shLog.getRange(1,1,1,shLog.getLastColumn()).getValues()[0];
+  const idxLog = Object.fromEntries(headers.map((h, i) => [h, i]));
+  
+  const dataDoc = shDoc.getDataRange().getValues();
+  const hdrDoc = dataDoc[0];
+  const iDoc = {
+    maestro: hdrDoc.indexOf('Maestro'),
+    email: hdrDoc.indexOf('Email'),
+    carpetaId: hdrDoc.indexOf('CarpetaID'),
+    activo: hdrDoc.indexOf('Activo')
+  };
+
+  // Para evitar duplicados, cargamos FileID ya registrados
+  const existing = shLog.getLastRow() > 1 
+    ? shLog.getRange(2,1,shLog.getLastRow()-1,shLog.getLastColumn()).getValues().map(r => String(r[idxLog['FileID']]))
+    : [];
+  const seen = new Set(existing);
+
+  const rowsToAppend = [];
+
+  for (let r=1; r<dataDoc.length; r++) {
+    const activo = String(dataDoc[r][iDoc.activo]).toLowerCase() !== 'false';
+    if (!activo) continue;
+    const maestro = cleanString_(dataDoc[r][iDoc.maestro]);
+    const carpetaId = cleanString_(dataDoc[r][iDoc.carpetaId]);
+    if (!maestro || !carpetaId) continue;
+
+    const personal = DriveApp.getFolderById(carpetaId);
+    // Solo meses del año configurado
+    const subFolders = personal.getFolders();
+    while (subFolders.hasNext()) {
+      const f = subFolders.next();
+      const name = f.getName(); // ej. 2025-09
+      if (!String(name).startsWith(String(year))) continue;
+
+      const monthNum = Number(name.split('-')[1]);
+      if (!monthNum) continue;
+
+      const files = f.getFiles();
+      while (files.hasNext()) {
+        const file = files.next();
+        const fileId = file.getId();
+        if (seen.has(fileId)) continue; // ya registrado
+
+        const created = file.getDateCreated();
+        const updated = file.getLastUpdated();
+        const fecha = updated || created;
+        const mesYYYYMM = formatYYYYMM_(fecha);
+        const semanaIso = isoWeek_(fecha);
+        const sizeMB = (file.getSize() || 0) / (1024*1024);
+        const url = file.getUrl();
+        const nombre = file.getName();
+        const owner = file.getOwner() ? file.getOwner().getEmail() : '';
+
+        // Heurística simple para "Tipo": si el nombre contiene alguna palabra clave de TIPOS_DOC
+        const lower = nombre.toLowerCase();
+        let tipo = '';
+        for (const t of tiposDoc) {
+          if (!t) continue;
+          if (lower.includes(t)) { tipo = t; break; }
+        }
+        if (!tipo) tipo = 'documento';
+
+        // Regla "A tiempo": si la fecha de actualización <= día límite de ese mes
+        const limite = new Date(fecha.getFullYear(), fecha.getMonth(), deadlineDay, 23, 59, 59);
+        const aTiempo = fecha.getTime() <= limite.getTime();
+
+        const row = [
+          fecha,               // Fecha
+          mesYYYYMM,           // Mes
+          semanaIso,           // SemanaISO
+          maestro,             // Maestro
+          nombre,              // Archivo
+          tipo,                // Tipo
+          url,                 // URL
+          f.getId(),           // CarpetaID (mes)
+          fileId,              // FileID
+          owner,               // SubidoPor (dueño)
+          Number(sizeMB.toFixed(2)), // TamañoMB
+          updated,             // Modificado
+          aTiempo              // ATiempo (boolean)
+        ];
+        rowsToAppend.push(row);
+        seen.add(fileId);
+      }
+    }
+  }
+
+  if (rowsToAppend.length) {
+    shLog.getRange(shLog.getLastRow()+1, 1, rowsToAppend.length, rowsToAppend[0].length).setValues(rowsToAppend);
+  }
+  SpreadsheetApp.getUi().alert(`Sincronización completa. Nuevos registros: ${rowsToAppend.length}`);
+}
+
+/***** 4) DISPARADOR DIARIO *****/
+function installDailyTrigger() {
+  // Limpia triggers anteriores de este proyecto
+  ScriptApp.getProjectTriggers().forEach(t => ScriptApp.deleteTrigger(t));
+  // Ejecuta syncAllDeliveries todos los días a las 18:00 (hora de tu cuenta)
+  ScriptApp.newTrigger('syncAllDeliveries')
+    .timeBased()
+    .atHour(18)
+    .everyDays(1)
+    .create();
+  SpreadsheetApp.getUi().alert('Disparador diario instalado (18:00).');
+}
